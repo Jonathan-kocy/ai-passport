@@ -1,4 +1,5 @@
 // Host tests for main/flappy_model.c (no ESP-IDF, no LVGL).
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,13 +92,12 @@ static void test_tutorial_full_flow(void) {
     tap(&m, FLAPPY_KEY_DOWN);               // must flap first
     CHECK(m.tut_step == FLAPPY_TUT_FLAP);
     tap(&m, FLAPPY_KEY_UP);
-    CHECK(m.tut_step == FLAPPY_TUT_DIVE);
+    CHECK(m.tut_step == FLAPPY_TUT_PAUSE);
     CHECK(m.bird_vy_q8 == FLAPPY_FLAP_VY_Q8);
 
     run(&m, 300);
-    tap(&m, FLAPPY_KEY_DOWN);
+    tap(&m, FLAPPY_KEY_DOWN);               // volume belongs to settings, not the tutorial
     CHECK(m.tut_step == FLAPPY_TUT_PAUSE);
-    CHECK(m.bird_vy_q8 >= FLAPPY_DIVE_VY_Q8);
 
     // Practice autopilot keeps the bird off the ground while reading.
     run(&m, 5000);
@@ -128,9 +128,19 @@ static void test_tutorial_full_flow(void) {
         if (i == 0) tap(&m, FLAPPY_KEY_UP);
         autopilot_step(&m);
     }
-    CHECK(m.tut_step == FLAPPY_TUT_DONE);
+    CHECK(m.tut_step == FLAPPY_TUT_SETTINGS);
     CHECK(m.tut_attempts == 0);
     CHECK(!m.tutorial_done);
+
+    // The settings card waits for OK, then the short celebration runs.
+    run(&m, FLAPPY_TUTORIAL_DONE_MS + 20);
+    tap(&m, FLAPPY_KEY_UP);
+    CHECK(m.tut_step == FLAPPY_TUT_SETTINGS);
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.tut_step == FLAPPY_TUT_DONE);
+    CHECK(!m.tutorial_done);
+    CHECK(m.volume == FLAPPY_VOL_HIGH);
+    CHECK(!(s_seen & FLAPPY_EV_VOLUME));
 
     run(&m, FLAPPY_TUTORIAL_DONE_MS + 20);
     CHECK(m.state == FLAPPY_READY);
@@ -179,7 +189,11 @@ static void test_title_menu(void) {
     tap(&m, FLAPPY_KEY_DOWN);
     CHECK(m.menu_sel == FLAPPY_MENU_TUTORIAL);
     tap(&m, FLAPPY_KEY_DOWN);
+    CHECK(m.menu_sel == FLAPPY_MENU_SETTINGS);
+    tap(&m, FLAPPY_KEY_DOWN);
     CHECK(m.menu_sel == FLAPPY_MENU_PLAY);  // wraps
+    tap(&m, FLAPPY_KEY_UP);
+    CHECK(m.menu_sel == FLAPPY_MENU_SETTINGS);
     tap(&m, FLAPPY_KEY_UP);
     CHECK(m.menu_sel == FLAPPY_MENU_TUTORIAL);
     tap(&m, FLAPPY_KEY_OK);
@@ -245,8 +259,149 @@ static void test_autopilot_scores_and_levels_are_fair(void) {
         }
         CHECK(m.state == FLAPPY_PLAYING);   // autopilot survives a minute
         CHECK(m.score >= 25);
-        CHECK(flappy_gap_for_score(m.score) == FLAPPY_GAP_MIN);
+        CHECK(flappy_gap_for_score(m.difficulty, m.score) == FLAPPY_GAP_MIN);
     }
+}
+
+// Beam search over flap decisions, limited to a tap rate a player can reach. The
+// world is deterministic for a seed, so copies of the model share the same pipes.
+#define BEAM_WIDTH 48
+#define BEAM_TAP_STEPS 12    // one decision per 120 ms
+
+static int beam_distance(const flappy_model_t *m) {
+    const flappy_pipe_t *p = next_pipe(m);
+    return abs(flappy_bird_y(m) - (p ? p->gap_y : 160));
+}
+
+static bool beam_survives_a_minute(const flappy_model_t *start) {
+    static flappy_model_t beam[BEAM_WIDTH];
+    static flappy_model_t next[BEAM_WIDTH * 2];
+    int count = 1;
+    beam[0] = *start;
+    for (int t = 0; t < 6000 / BEAM_TAP_STEPS; t++) {
+        int n = 0;
+        for (int i = 0; i < count; i++) {
+            for (int do_flap = 0; do_flap < 2; do_flap++) {
+                flappy_model_t c = beam[i];
+                if (do_flap) tap(&c, FLAPPY_KEY_UP);
+                flappy_advance(&c, BEAM_TAP_STEPS * FLAPPY_STEP_MS);
+                flappy_take_events(&c);
+                if (c.state != FLAPPY_PLAYING) continue;
+                bool duplicate = false;
+                for (int k = 0; k < n && !duplicate; k++) {
+                    duplicate = flappy_bird_y(&next[k]) == flappy_bird_y(&c) &&
+                                next[k].bird_vy_q8 / 32 == c.bird_vy_q8 / 32;
+                }
+                if (!duplicate) next[n++] = c;
+            }
+        }
+        if (n == 0) return false;
+        // Keep the states closest to the next gap.
+        for (int i = 0; i < n && i < BEAM_WIDTH; i++) {
+            int best = i;
+            for (int k = i + 1; k < n; k++) {
+                if (beam_distance(&next[k]) < beam_distance(&next[best])) best = k;
+            }
+            flappy_model_t tmp = next[i];
+            next[i] = next[best];
+            next[best] = tmp;
+            beam[i] = next[i];
+        }
+        count = n < BEAM_WIDTH ? n : BEAM_WIDTH;
+    }
+    return true;
+}
+
+// Every difficulty and flap strength must stay passable, including at top speed.
+static void test_all_settings_are_passable(void) {
+    for (int d = 0; d < FLAPPY_DIFF_COUNT; d++) {
+        for (int f = 0; f < FLAPPY_FLAP_COUNT; f++) {
+            for (uint32_t seed = 1; seed <= 4; seed++) {
+                flappy_model_t m;
+                flappy_init(&m, 0, true, seed * 2654435761u);
+                const flappy_saved_t saved = {
+                    .volume = FLAPPY_VOL_HIGH, .flap = (uint8_t)f,
+                    .difficulty = (uint8_t)d, .theme = FLAPPY_THEME_DAY,
+                };
+                flappy_restore(&m, &saved);
+                tap(&m, FLAPPY_KEY_OK);
+                tap(&m, FLAPPY_KEY_UP);
+                const bool ok = beam_survives_a_minute(&m);
+                if (!ok) fprintf(stderr, "difficulty %d flap %d seed %u: no path\n", d, f, (unsigned)seed);
+                CHECK(ok);
+            }
+        }
+    }
+    CHECK(flappy_flap_vy_q8(FLAPPY_FLAP_SOFT) > flappy_flap_vy_q8(FLAPPY_FLAP_NORMAL));
+    CHECK(flappy_flap_vy_q8(FLAPPY_FLAP_STRONG) < flappy_flap_vy_q8(FLAPPY_FLAP_NORMAL));
+    CHECK(flappy_gap_for_score(FLAPPY_DIFF_EASY, 0) > flappy_gap_for_score(FLAPPY_DIFF_HARD, 0));
+    CHECK(flappy_speed_q8_for_score(FLAPPY_DIFF_EASY, 0) < flappy_speed_q8_for_score(FLAPPY_DIFF_HARD, 0));
+}
+
+static void test_settings_screen(void) {
+    flappy_model_t m;
+    flappy_init(&m, 5, true, 50);
+    tap(&m, FLAPPY_KEY_DOWN);
+    tap(&m, FLAPPY_KEY_DOWN);
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.state == FLAPPY_SETTINGS);
+    CHECK(m.settings_sel == FLAPPY_SET_VOLUME);
+    flappy_take_events(&m);
+
+    // OK steps the selected row; UP and DOWN only move, and wrap.
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.volume == FLAPPY_VOL_MED);
+    CHECK(flappy_take_events(&m) & FLAPPY_EV_VOLUME);
+    tap(&m, FLAPPY_KEY_UP);
+    CHECK(m.settings_sel == FLAPPY_SET_BACK);
+    tap(&m, FLAPPY_KEY_DOWN);
+    CHECK(m.settings_sel == FLAPPY_SET_VOLUME);
+    CHECK(m.volume == FLAPPY_VOL_MED);
+
+    tap(&m, FLAPPY_KEY_DOWN);
+    flappy_take_events(&m);
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.flap == FLAPPY_FLAP_STRONG);
+    CHECK(flappy_take_events(&m) & FLAPPY_EV_SETTING);
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.flap == FLAPPY_FLAP_SOFT);
+
+    // Each difficulty has its own record.
+    tap(&m, FLAPPY_KEY_DOWN);
+    CHECK(m.best == 5);
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.difficulty == FLAPPY_DIFF_HARD);
+    CHECK(m.best == 0);
+
+    tap(&m, FLAPPY_KEY_DOWN);
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.theme == FLAPPY_THEME_SUNSET);
+
+    tap(&m, FLAPPY_KEY_DOWN);
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.state == FLAPPY_TITLE);
+    CHECK(m.menu_sel == FLAPPY_MENU_SETTINGS);
+
+    // Settings apply to play, and a record lands on its own difficulty.
+    tap(&m, FLAPPY_KEY_DOWN);
+    tap(&m, FLAPPY_KEY_OK);
+    tap(&m, FLAPPY_KEY_UP);
+    CHECK(m.bird_vy_q8 == flappy_flap_vy_q8(FLAPPY_FLAP_SOFT));
+    CHECK(m.pipes[0].gap_h == flappy_gap_for_score(FLAPPY_DIFF_HARD, 0));
+    m.score = 2;
+    flappy_take_events(&m);
+    run(&m, 4000);
+    CHECK(m.state == FLAPPY_GAME_OVER);
+    CHECK(s_seen & FLAPPY_EV_NEW_BEST);
+    CHECK(m.bests[FLAPPY_DIFF_HARD] == 2);
+    CHECK(m.bests[FLAPPY_DIFF_NORMAL] == 5);
+
+    // Corrupt stored values fall back to defaults.
+    const flappy_saved_t bad = { .best = { 1, 2, 3 }, .volume = 200, .flap = 9, .difficulty = 9, .theme = 9 };
+    flappy_restore(&m, &bad);
+    CHECK(m.volume == FLAPPY_VOL_HIGH && m.flap == FLAPPY_FLAP_NORMAL);
+    CHECK(m.difficulty == FLAPPY_DIFF_NORMAL && m.theme == FLAPPY_THEME_DAY);
+    CHECK(m.best == 2);
 }
 
 static void test_pause_resume_and_quit(void) {
@@ -266,8 +421,9 @@ static void test_pause_resume_and_quit(void) {
     CHECK(flappy_bird_y(&m) == y);
     CHECK(flappy_pipe_x(&m.pipes[0]) == px);
 
-    tap(&m, FLAPPY_KEY_DOWN);                           // DOWN does nothing when paused
+    tap(&m, FLAPPY_KEY_DOWN);                           // DOWN only changes the volume
     CHECK(m.state == FLAPPY_PAUSED);
+    CHECK(m.volume == FLAPPY_VOL_MED);
     tap(&m, FLAPPY_KEY_OK);
     CHECK(m.state == FLAPPY_PLAYING);
 
@@ -314,20 +470,54 @@ static void test_game_over_retry_rules_and_best(void) {
     CHECK(m.state == FLAPPY_TITLE);
 }
 
-static void test_dive_cooldown_and_clamps(void) {
+static void test_volume_control(void) {
     flappy_model_t m;
+    flappy_init(&m, 0, true, 44);
+    CHECK(m.volume == FLAPPY_VOL_HIGH);
+    CHECK(flappy_volume_percent(FLAPPY_VOL_MUTE) == 0);
+    CHECK(flappy_volume_percent(FLAPPY_VOL_LOW) < flappy_volume_percent(FLAPPY_VOL_MED));
+    CHECK(flappy_volume_percent(FLAPPY_VOL_MED) < flappy_volume_percent(FLAPPY_VOL_HIGH));
+
+    const flappy_saved_t saved = {
+        .volume = FLAPPY_VOL_LOW, .flap = FLAPPY_FLAP_NORMAL,
+        .difficulty = FLAPPY_DIFF_NORMAL, .theme = FLAPPY_THEME_DAY,
+    };
+    flappy_take_events(&m);
+    flappy_restore(&m, &saved);
+    CHECK(m.volume == FLAPPY_VOL_LOW);
+    CHECK(!flappy_take_events(&m));                        // restoring is silent
+    flappy_init(&m, 0, true, 44);
+
+    // The title keeps DOWN for the menu.
+    tap(&m, FLAPPY_KEY_DOWN);
+    CHECK(m.volume == FLAPPY_VOL_HIGH);
+    CHECK(!(flappy_take_events(&m) & FLAPPY_EV_VOLUME));
+    tap(&m, FLAPPY_KEY_UP);
+    tap(&m, FLAPPY_KEY_OK);
+    CHECK(m.state == FLAPPY_READY);
+    flappy_take_events(&m);
+    tap(&m, FLAPPY_KEY_DOWN);
+    CHECK(m.state == FLAPPY_READY);
+    CHECK(m.volume == FLAPPY_VOL_MED);
+    CHECK(flappy_take_events(&m) & FLAPPY_EV_VOLUME);
+
+    // In play, DOWN never touches the bird and steps down, then wraps.
     start_game(&m, 44, 0);
     flappy_take_events(&m);
-    tap(&m, FLAPPY_KEY_DOWN);
-    CHECK(flappy_take_events(&m) & FLAPPY_EV_DIVE);
-    tap(&m, FLAPPY_KEY_DOWN);
-    CHECK(!(flappy_take_events(&m) & FLAPPY_EV_DIVE)); // cooling down
-    for (int i = 0; i < FLAPPY_DIVE_COOLDOWN_MS / 10; i++) autopilot_step(&m);
-    CHECK(m.state == FLAPPY_PLAYING);
-    flappy_take_events(&m);
-    tap(&m, FLAPPY_KEY_DOWN);
-    CHECK(flappy_take_events(&m) & FLAPPY_EV_DIVE);
+    const int32_t vy = m.bird_vy_q8;
+    static const flappy_volume_t order[] = {
+        FLAPPY_VOL_MED, FLAPPY_VOL_LOW, FLAPPY_VOL_MUTE, FLAPPY_VOL_HIGH, FLAPPY_VOL_MED,
+    };
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+        tap(&m, FLAPPY_KEY_DOWN);
+        CHECK(m.volume == order[i]);
+        CHECK(m.bird_vy_q8 == vy);
+        CHECK(m.state == FLAPPY_PLAYING);
+        CHECK(flappy_take_events(&m) & FLAPPY_EV_VOLUME);
+    }
+}
 
+static void test_clamps(void) {
     // A long stall advances at most FLAPPY_MAX_ELAPSED_MS of game time.
     flappy_model_t a;
     start_game(&a, 45, 0);
@@ -368,9 +558,10 @@ static void test_presentation_helpers(void) {
     }
     flappy_pipe_t p = { .x_q8 = -FLAPPY_Q8(3) - 10 };
     CHECK(flappy_pipe_x(&p) == -4);                    // floors through negatives
-    CHECK(flappy_speed_q8_for_score(0) == FLAPPY_SPEED_BASE_Q8);
-    CHECK(flappy_speed_q8_for_score(1000) == flappy_speed_q8_for_score(FLAPPY_SPEED_CAP_SCORE));
-    CHECK(flappy_gap_for_score(0) == FLAPPY_GAP_MAX);
+    CHECK(flappy_speed_q8_for_score(FLAPPY_DIFF_NORMAL, 0) == FLAPPY_SPEED_BASE_Q8);
+    CHECK(flappy_speed_q8_for_score(FLAPPY_DIFF_NORMAL, 1000) ==
+          flappy_speed_q8_for_score(FLAPPY_DIFF_NORMAL, FLAPPY_SPEED_CAP_SCORE));
+    CHECK(flappy_gap_for_score(FLAPPY_DIFF_NORMAL, 0) == FLAPPY_GAP_MAX);
 }
 
 int main(void) {
@@ -381,9 +572,12 @@ int main(void) {
     test_title_menu();
     test_fall_to_ground_is_game_over();
     test_autopilot_scores_and_levels_are_fair();
+    test_all_settings_are_passable();
+    test_settings_screen();
     test_pause_resume_and_quit();
     test_game_over_retry_rules_and_best();
-    test_dive_cooldown_and_clamps();
+    test_volume_control();
+    test_clamps();
     test_presentation_helpers();
     if (s_failures) {
         fprintf(stderr, "test_flappy_model: %d failure(s)\n", s_failures);

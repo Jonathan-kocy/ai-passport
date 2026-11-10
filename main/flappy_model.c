@@ -11,6 +11,19 @@
 #define GAP_STEP_LIMIT 70    // max change of gap centre between neighbours
 #define TUT_GATE_Y     HOVER_Y
 
+typedef struct {
+    int16_t gap_max;
+    int16_t gap_min;
+    int16_t speed_base_q8;
+    int16_t speed_step_q8;
+} difficulty_t;
+
+static const difficulty_t DIFFICULTY[FLAPPY_DIFF_COUNT] = {
+    [FLAPPY_DIFF_EASY]   = { 116, 96, 270, 3 },
+    [FLAPPY_DIFF_NORMAL] = { FLAPPY_GAP_MAX, FLAPPY_GAP_MIN, FLAPPY_SPEED_BASE_Q8, FLAPPY_SPEED_STEP_Q8 },
+    [FLAPPY_DIFF_HARD]   = { 92, 76, 370, 5 },
+};
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -48,7 +61,6 @@ static void set_step(flappy_model_t *m, flappy_tutorial_step_t step) {
 static void reset_bird(flappy_model_t *m) {
     m->bird_y_q8 = FLAPPY_Q8(HOVER_Y);
     m->bird_vy_q8 = 0;
-    m->dive_cooldown_ms = 0;
     m->flap_anim_ms = 1000;
 }
 
@@ -57,16 +69,15 @@ static void clear_pipes(flappy_model_t *m) {
 }
 
 static void flap(flappy_model_t *m) {
-    m->bird_vy_q8 = FLAPPY_FLAP_VY_Q8;
+    m->bird_vy_q8 = flappy_flap_vy_q8(m->flap);
     m->flap_anim_ms = 0;
     m->events |= FLAPPY_EV_FLAP;
 }
 
-static void dive(flappy_model_t *m, bool ignore_cooldown) {
-    if (!ignore_cooldown && m->dive_cooldown_ms > 0) return;
-    if (m->bird_vy_q8 < FLAPPY_DIVE_VY_Q8) m->bird_vy_q8 = FLAPPY_DIVE_VY_Q8;
-    m->dive_cooldown_ms = FLAPPY_DIVE_COOLDOWN_MS;
-    m->events |= FLAPPY_EV_DIVE;
+static void volume_down(flappy_model_t *m) {
+    m->volume = m->volume == FLAPPY_VOL_MUTE ? FLAPPY_VOL_HIGH
+                                             : (flappy_volume_t)(m->volume - 1);
+    m->events |= FLAPPY_EV_VOLUME;
 }
 
 static int hover_bob(uint32_t world_ms) {
@@ -139,10 +150,10 @@ static void move_pipes(flappy_model_t *m, int32_t speed_q8) {
 static void maybe_spawn(flappy_model_t *m) {
     const flappy_pipe_t *last = rightmost_pipe(m);
     if (!last) {
-        spawn_pipe(m, FLAPPY_Q8(FLAPPY_W + 40), flappy_gap_for_score(m->score), 0);
+        spawn_pipe(m, FLAPPY_Q8(FLAPPY_W + 40), flappy_gap_for_score(m->difficulty, m->score), 0);
     } else if (last->x_q8 <= FLAPPY_Q8(FLAPPY_W - FLAPPY_PIPE_SPACING)) {
         spawn_pipe(m, last->x_q8 + FLAPPY_Q8(FLAPPY_PIPE_SPACING),
-                   flappy_gap_for_score(m->score), last->gap_y);
+                   flappy_gap_for_score(m->difficulty, m->score), last->gap_y);
     }
 }
 
@@ -190,6 +201,11 @@ static void enter_title(flappy_model_t *m) {
     m->menu_sel = FLAPPY_MENU_PLAY;
     reset_bird(m);
     clear_pipes(m);
+}
+
+static void enter_settings(flappy_model_t *m) {
+    set_state(m, FLAPPY_SETTINGS);
+    m->settings_sel = FLAPPY_SET_VOLUME;
 }
 
 static void enter_ready(flappy_model_t *m) {
@@ -241,6 +257,7 @@ static void game_over(flappy_model_t *m) {
     m->events |= FLAPPY_EV_GROUND;
     if (m->score > m->best) {
         m->best = m->score;
+        m->bests[m->difficulty] = m->score;
         m->new_best = true;
         m->events |= FLAPPY_EV_NEW_BEST;
     }
@@ -252,14 +269,55 @@ static void game_over(flappy_model_t *m) {
 void flappy_init(flappy_model_t *m, uint16_t best, bool tutorial_done, uint32_t seed) {
     memset(m, 0, sizeof(*m));
     m->best = best;
+    m->bests[FLAPPY_DIFF_NORMAL] = best;
     m->tutorial_done = tutorial_done;
     m->rng = seed ? seed : 0x2545F491u;
+    m->volume = FLAPPY_VOL_HIGH;
+    m->flap = FLAPPY_FLAP_NORMAL;
+    m->difficulty = FLAPPY_DIFF_NORMAL;
+    m->theme = FLAPPY_THEME_DAY;
     reset_bird(m);
     if (tutorial_done) {
         enter_title(m);
     } else {
         enter_tutorial(m);
     }
+}
+
+void flappy_restore(flappy_model_t *m, const flappy_saved_t *saved) {
+    m->volume = saved->volume < FLAPPY_VOL_COUNT ? (flappy_volume_t)saved->volume : FLAPPY_VOL_HIGH;
+    m->flap = saved->flap < FLAPPY_FLAP_COUNT ? (flappy_flap_t)saved->flap : FLAPPY_FLAP_NORMAL;
+    m->difficulty = saved->difficulty < FLAPPY_DIFF_COUNT ? (flappy_difficulty_t)saved->difficulty
+                                                          : FLAPPY_DIFF_NORMAL;
+    m->theme = saved->theme < FLAPPY_THEME_COUNT ? (flappy_theme_t)saved->theme : FLAPPY_THEME_DAY;
+    memcpy(m->bests, saved->best, sizeof(m->bests));
+    m->best = m->bests[m->difficulty];
+}
+
+// OK on a settings row: step its value, or leave on BACK.
+static void settings_select(flappy_model_t *m) {
+    switch (m->settings_sel) {
+    case FLAPPY_SET_VOLUME:
+        volume_down(m);        // EV_VOLUME previews and persists it
+        m->events |= FLAPPY_EV_STATE;
+        return;
+    case FLAPPY_SET_FLAP:
+        m->flap = (flappy_flap_t)((m->flap + 1) % FLAPPY_FLAP_COUNT);
+        break;
+    case FLAPPY_SET_DIFFICULTY:
+        m->difficulty = (flappy_difficulty_t)((m->difficulty + 1) % FLAPPY_DIFF_COUNT);
+        m->best = m->bests[m->difficulty];
+        break;
+    case FLAPPY_SET_THEME:
+        m->theme = (flappy_theme_t)((m->theme + 1) % FLAPPY_THEME_COUNT);
+        break;
+    default:
+        m->events |= FLAPPY_EV_SELECT;
+        enter_title(m);
+        m->menu_sel = FLAPPY_MENU_SETTINGS;
+        return;
+    }
+    m->events |= FLAPPY_EV_SELECT | FLAPPY_EV_SETTING | FLAPPY_EV_STATE;
 }
 
 static bool tutorial_press(flappy_model_t *m, flappy_key_t key) {
@@ -271,17 +329,11 @@ static bool tutorial_press(flappy_model_t *m, flappy_key_t key) {
     case FLAPPY_TUT_FLAP:
         if (key != FLAPPY_KEY_UP) return false;
         flap(m);
-        set_step(m, FLAPPY_TUT_DIVE);
-        return true;
-    case FLAPPY_TUT_DIVE:
-        if (key == FLAPPY_KEY_UP) { flap(m); return true; }
-        if (key != FLAPPY_KEY_DOWN) return false;
-        dive(m, true);
         set_step(m, FLAPPY_TUT_PAUSE);
         return true;
     case FLAPPY_TUT_PAUSE:
         if (key == FLAPPY_KEY_UP) { flap(m); return true; }
-        if (key == FLAPPY_KEY_DOWN) { dive(m, false); return true; }
+        if (key == FLAPPY_KEY_DOWN) return false;
         m->tut_paused = true;
         m->events |= FLAPPY_EV_PAUSE;
         set_step(m, FLAPPY_TUT_RESUME);
@@ -295,11 +347,12 @@ static bool tutorial_press(flappy_model_t *m, flappy_key_t key) {
             flap(m);
             return true;
         }
-        if (key == FLAPPY_KEY_DOWN && m->tut_flying) {
-            dive(m, false);
-            return true;
-        }
         return false;
+    case FLAPPY_TUT_SETTINGS:
+        if (key == FLAPPY_KEY_UP) { flap(m); return true; }
+        if (key == FLAPPY_KEY_DOWN) return false;
+        set_step(m, FLAPPY_TUT_DONE);
+        return true;
     default:
         return false;
     }
@@ -315,21 +368,33 @@ static bool handle_press(flappy_model_t *m, flappy_key_t key) {
             return true;
         }
         m->events |= FLAPPY_EV_SELECT;
-        if (m->menu_sel == FLAPPY_MENU_PLAY && m->tutorial_done) {
+        if (m->menu_sel == FLAPPY_MENU_SETTINGS) {
+            enter_settings(m);
+        } else if (m->menu_sel == FLAPPY_MENU_PLAY && m->tutorial_done) {
             enter_ready(m);
         } else {
             enter_tutorial(m);   // first play always teaches the controls
         }
         return true;
+    case FLAPPY_SETTINGS:
+        if (key == FLAPPY_KEY_OK) {
+            settings_select(m);
+        } else {
+            int d = key == FLAPPY_KEY_UP ? FLAPPY_SET_COUNT - 1 : 1;
+            m->settings_sel = (flappy_setting_t)((m->settings_sel + d) % FLAPPY_SET_COUNT);
+            m->events |= FLAPPY_EV_MENU_MOVE | FLAPPY_EV_STATE;
+        }
+        return true;
     case FLAPPY_TUTORIAL:
         return tutorial_press(m, key);
     case FLAPPY_READY:
+        if (key == FLAPPY_KEY_DOWN) { volume_down(m); return true; }
         if (key != FLAPPY_KEY_UP) return false;
         start_playing(m);
         return true;
     case FLAPPY_PLAYING:
         if (key == FLAPPY_KEY_UP) flap(m);
-        else if (key == FLAPPY_KEY_DOWN) dive(m, false);
+        else if (key == FLAPPY_KEY_DOWN) volume_down(m);
         else {
             set_state(m, FLAPPY_PAUSED);
             m->events |= FLAPPY_EV_PAUSE;
@@ -345,7 +410,8 @@ static bool handle_press(flappy_model_t *m, flappy_key_t key) {
             m->events |= FLAPPY_EV_RESUME;
             return true;
         }
-        return false;
+        volume_down(m);
+        return true;
     case FLAPPY_GAME_OVER:
         if (m->state_ms < FLAPPY_GAME_OVER_LOCK_MS) return true;
         m->events |= FLAPPY_EV_SELECT;
@@ -424,7 +490,7 @@ static void tutorial_step_once(flappy_model_t *m) {
         }
         if (update_scoring(m) > 0) {
             m->events |= FLAPPY_EV_SCORE;
-            set_step(m, FLAPPY_TUT_DONE);
+            set_step(m, FLAPPY_TUT_SETTINGS);
         }
         return;
     }
@@ -449,12 +515,11 @@ static void step_once(flappy_model_t *m) {
     if (!paused) {
         m->world_ms += FLAPPY_STEP_MS;
         if (m->flap_anim_ms < 100000u) m->flap_anim_ms += FLAPPY_STEP_MS;
-        if (m->dive_cooldown_ms >= FLAPPY_STEP_MS) m->dive_cooldown_ms -= FLAPPY_STEP_MS;
-        else m->dive_cooldown_ms = 0;
     }
 
     switch (m->state) {
     case FLAPPY_TITLE:
+    case FLAPPY_SETTINGS:
     case FLAPPY_READY:
         scroll_ground(m, FLAPPY_SPEED_BASE_Q8);
         hover(m);
@@ -463,7 +528,7 @@ static void step_once(flappy_model_t *m) {
         tutorial_step_once(m);
         break;
     case FLAPPY_PLAYING: {
-        const int32_t speed = flappy_speed_q8_for_score(m->score);
+        const int32_t speed = flappy_speed_q8_for_score(m->difficulty, m->score);
         scroll_ground(m, speed);
         move_pipes(m, speed);
         maybe_spawn(m);
@@ -517,7 +582,7 @@ int flappy_bird_y(const flappy_model_t *m) {
 }
 
 static bool bird_is_hovering(const flappy_model_t *m) {
-    return m->state == FLAPPY_TITLE || m->state == FLAPPY_READY ||
+    return m->state == FLAPPY_TITLE || m->state == FLAPPY_SETTINGS || m->state == FLAPPY_READY ||
            (m->state == FLAPPY_TUTORIAL && m->tut_step == FLAPPY_TUT_GATE && !m->tut_flying);
 }
 
@@ -550,12 +615,26 @@ int flappy_ground_offset(const flappy_model_t *m, int period) {
     return (int)((m->ground_q8 >> 8) % period);
 }
 
-int flappy_gap_for_score(uint16_t score) {
-    int gap = FLAPPY_GAP_MAX - (int)score;
-    return gap < FLAPPY_GAP_MIN ? FLAPPY_GAP_MIN : gap;
+int flappy_gap_for_score(flappy_difficulty_t difficulty, uint16_t score) {
+    const difficulty_t *d = &DIFFICULTY[difficulty];
+    int gap = d->gap_max - (int)score;
+    return gap < d->gap_min ? d->gap_min : gap;
 }
 
-int32_t flappy_speed_q8_for_score(uint16_t score) {
+int flappy_volume_percent(flappy_volume_t level) {
+    // HIGH is the original fixed level. The codec curve is about 0.5 dB per percent.
+    static const uint8_t percent[FLAPPY_VOL_COUNT] = { 0, 35, 50, 65 };
+    return (unsigned)level < FLAPPY_VOL_COUNT ? percent[level] : percent[FLAPPY_VOL_HIGH];
+}
+
+int32_t flappy_speed_q8_for_score(flappy_difficulty_t difficulty, uint16_t score) {
+    const difficulty_t *d = &DIFFICULTY[difficulty];
     int s = score > FLAPPY_SPEED_CAP_SCORE ? FLAPPY_SPEED_CAP_SCORE : score;
-    return FLAPPY_SPEED_BASE_Q8 + (int32_t)s * FLAPPY_SPEED_STEP_Q8;
+    return d->speed_base_q8 + (int32_t)s * d->speed_step_q8;
+}
+
+int32_t flappy_flap_vy_q8(flappy_flap_t flap) {
+    // Rise is about 26, 36, or 49 px.
+    static const int16_t vy[FLAPPY_FLAP_COUNT] = { -640, FLAPPY_FLAP_VY_Q8, -880 };
+    return vy[flap];
 }

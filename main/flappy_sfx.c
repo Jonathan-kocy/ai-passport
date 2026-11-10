@@ -26,7 +26,7 @@ typedef struct {
 static const effect_t EFFECTS[FLAPPY_SFX_COUNT] = {
     [FLAPPY_SFX_NONE]     = { 0, 0 },
     [FLAPPY_SFX_FLAP]     = SEGS({ 520, 900, 70, WAVE_SQUARE, 55 }),
-    [FLAPPY_SFX_DIVE]     = SEGS({ 760, 280, 90, WAVE_TRIANGLE, 80 }),
+    [FLAPPY_SFX_VOLUME]   = SEGS({ 880, 880, 120, WAVE_SQUARE, 55 }),
     [FLAPPY_SFX_SCORE]    = SEGS({ 988, 988, 60, WAVE_SQUARE, 50 },
                                  { 1319, 1319, 110, WAVE_SQUARE, 50 }),
     [FLAPPY_SFX_HIT]      = SEGS({ 0, 0, 90, WAVE_NOISE, 85 },

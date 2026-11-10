@@ -26,8 +26,8 @@
 #define FLAPPY_PIPE_W       44
 #define FLAPPY_PIPE_COUNT   3
 #define FLAPPY_PIPE_SPACING 150      // horizontal distance between pipe pairs
-#define FLAPPY_GAP_MAX      100      // gap height at score 0
-#define FLAPPY_GAP_MIN      80       // narrowest gap (reached at score 20)
+#define FLAPPY_GAP_MAX      100      // NORMAL gap height at score 0
+#define FLAPPY_GAP_MIN      80       // NORMAL narrowest gap (reached at score 20)
 #define FLAPPY_GAP_MARGIN   40       // minimum pipe length above/below a gap
 #define FLAPPY_TUTORIAL_GAP 112      // generous gap for the practice gate
 
@@ -37,12 +37,10 @@
 #define FLAPPY_STEP_MS        10
 #define FLAPPY_Q8(px)         ((int32_t)((px) * 256))
 #define FLAPPY_GRAVITY_Q8     31     // ~0.12 px/step^2
-#define FLAPPY_FLAP_VY_Q8     (-760) // ~-2.97 px/step: ~36 px rise
-#define FLAPPY_DIVE_VY_Q8     820    // ~3.2 px/step downward kick
+#define FLAPPY_FLAP_VY_Q8     (-760) // NORMAL: ~-2.97 px/step, ~36 px rise
 #define FLAPPY_MAX_VY_Q8      1280   // 5 px/step terminal velocity
-#define FLAPPY_DIVE_COOLDOWN_MS 450
-#define FLAPPY_SPEED_BASE_Q8  320    // 1.25 px/step = 125 px/s
-#define FLAPPY_SPEED_STEP_Q8  4      // added per point...
+#define FLAPPY_SPEED_BASE_Q8  320    // NORMAL: 1.25 px/step = 125 px/s
+#define FLAPPY_SPEED_STEP_Q8  4      // NORMAL: added per point...
 #define FLAPPY_SPEED_CAP_SCORE 30    // ...up to this score
 #define FLAPPY_GAME_OVER_LOCK_MS 700 // ignore retry presses right after a crash
 #define FLAPPY_TUTORIAL_DONE_MS  1500
@@ -51,6 +49,7 @@
 typedef enum {
     FLAPPY_TITLE = 0,
     FLAPPY_TUTORIAL,
+    FLAPPY_SETTINGS,
     FLAPPY_READY,
     FLAPPY_PLAYING,
     FLAPPY_PAUSED,
@@ -61,10 +60,10 @@ typedef enum {
 typedef enum {
     FLAPPY_TUT_WELCOME = 0, // press OK to begin
     FLAPPY_TUT_FLAP,        // press UP
-    FLAPPY_TUT_DIVE,        // press DOWN
     FLAPPY_TUT_PAUSE,       // press OK to pause
     FLAPPY_TUT_RESUME,      // tap OK again to resume
     FLAPPY_TUT_GATE,        // fly through one practice gate
+    FLAPPY_TUT_SETTINGS,    // press OK; points at the title menu's settings
     FLAPPY_TUT_DONE,        // short celebration, then READY
     FLAPPY_TUT_STEP_COUNT,
 } flappy_tutorial_step_t;
@@ -72,8 +71,58 @@ typedef enum {
 typedef enum {
     FLAPPY_MENU_PLAY = 0,
     FLAPPY_MENU_TUTORIAL,
+    FLAPPY_MENU_SETTINGS,
     FLAPPY_MENU_COUNT,
 } flappy_menu_t;
+
+// DOWN steps HIGH -> MED -> LOW -> MUTE, then wraps back to HIGH.
+typedef enum {
+    FLAPPY_VOL_MUTE = 0,
+    FLAPPY_VOL_LOW,
+    FLAPPY_VOL_MED,
+    FLAPPY_VOL_HIGH,
+    FLAPPY_VOL_COUNT,
+} flappy_volume_t;
+
+// How far one press lifts the bird; the game's control sensitivity.
+typedef enum {
+    FLAPPY_FLAP_SOFT = 0,
+    FLAPPY_FLAP_NORMAL,
+    FLAPPY_FLAP_STRONG,
+    FLAPPY_FLAP_COUNT,
+} flappy_flap_t;
+
+typedef enum {
+    FLAPPY_DIFF_EASY = 0,
+    FLAPPY_DIFF_NORMAL,
+    FLAPPY_DIFF_HARD,
+    FLAPPY_DIFF_COUNT,
+} flappy_difficulty_t;
+
+typedef enum {
+    FLAPPY_THEME_DAY = 0,
+    FLAPPY_THEME_SUNSET,
+    FLAPPY_THEME_NIGHT,
+    FLAPPY_THEME_COUNT,
+} flappy_theme_t;
+
+typedef enum {
+    FLAPPY_SET_VOLUME = 0,
+    FLAPPY_SET_FLAP,
+    FLAPPY_SET_DIFFICULTY,
+    FLAPPY_SET_THEME,
+    FLAPPY_SET_BACK,
+    FLAPPY_SET_COUNT,
+} flappy_setting_t;
+
+// Values read back from storage. Out-of-range settings fall back to defaults.
+typedef struct {
+    uint16_t best[FLAPPY_DIFF_COUNT];
+    uint8_t volume;
+    uint8_t flap;
+    uint8_t difficulty;
+    uint8_t theme;
+} flappy_saved_t;
 
 typedef enum {
     FLAPPY_KEY_UP = 0,
@@ -90,7 +139,7 @@ typedef enum {
 // Event bits collected since the last flappy_take_events(); drive sound/storage.
 enum {
     FLAPPY_EV_FLAP          = 1u << 0,
-    FLAPPY_EV_DIVE          = 1u << 1,
+    FLAPPY_EV_VOLUME        = 1u << 1,  // volume level changed; apply and persist it
     FLAPPY_EV_SCORE         = 1u << 2,
     FLAPPY_EV_HIT           = 1u << 3,
     FLAPPY_EV_GROUND        = 1u << 4,  // bird reached the ground: game over shown
@@ -103,6 +152,7 @@ enum {
     FLAPPY_EV_RESUME        = 1u << 11,
     FLAPPY_EV_STATE         = 1u << 12, // state or tutorial step changed: redraw overlays
     FLAPPY_EV_TUTORIAL_RETRY = 1u << 13,
+    FLAPPY_EV_SETTING       = 1u << 14, // settings_sel changed value; persist it
 };
 
 typedef struct {
@@ -120,10 +170,10 @@ typedef struct {
     bool tut_flying;          // practice gate: physics started by the first flap
     uint16_t tut_attempts;
     flappy_menu_t menu_sel;
+    flappy_setting_t settings_sel;
 
     int32_t bird_y_q8;        // bird centre y
     int32_t bird_vy_q8;
-    uint32_t dive_cooldown_ms;
     uint32_t flap_anim_ms;    // time since last flap (wing animation)
 
     flappy_pipe_t pipes[FLAPPY_PIPE_COUNT];
@@ -133,9 +183,14 @@ typedef struct {
     uint32_t acc_ms;          // unprocessed time below one step
 
     uint16_t score;
-    uint16_t best;
+    uint16_t best;            // record for the current difficulty
+    uint16_t bests[FLAPPY_DIFF_COUNT];
     bool new_best;
     bool tutorial_done;
+    flappy_volume_t volume;
+    flappy_flap_t flap;
+    flappy_difficulty_t difficulty;
+    flappy_theme_t theme;
 
     bool ok_armed;            // OK went down while a release-to-act state was shown
     bool ok_long_fired;
@@ -146,7 +201,11 @@ typedef struct {
 } flappy_model_t;
 
 // Start at the tutorial when it has never been completed, else at the title.
+// `best` is the NORMAL record; settings start at their defaults.
 void flappy_init(flappy_model_t *m, uint16_t best, bool tutorial_done, uint32_t seed);
+
+// Restore saved records and settings (no events).
+void flappy_restore(flappy_model_t *m, const flappy_saved_t *saved);
 
 // Feed one physical button event.
 void flappy_input(flappy_model_t *m, flappy_key_t key, flappy_key_ev_t ev);
@@ -163,5 +222,7 @@ int flappy_bird_angle_deci(const flappy_model_t *m);  // 0.1 degree, + = nose do
 int flappy_bird_frame(const flappy_model_t *m);       // wing frame 0..2
 int flappy_pipe_x(const flappy_pipe_t *p);            // left edge, pixels
 int flappy_ground_offset(const flappy_model_t *m, int period); // 0..period-1
-int flappy_gap_for_score(uint16_t score);
-int32_t flappy_speed_q8_for_score(uint16_t score);
+int flappy_gap_for_score(flappy_difficulty_t difficulty, uint16_t score);
+int32_t flappy_speed_q8_for_score(flappy_difficulty_t difficulty, uint16_t score);
+int32_t flappy_flap_vy_q8(flappy_flap_t flap);
+int flappy_volume_percent(flappy_volume_t level);    // codec output volume 0..100

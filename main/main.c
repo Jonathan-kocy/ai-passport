@@ -7,9 +7,11 @@
 //   * Sound, NVS writes and battery polling run in flappy_services workers.
 //
 // Controls (see docs/flappy-bird.md):
-//   UP    press  flap (title/menu: move up)
-//   DOWN  press  dive (title/menu: move down; game over: back to title)
-//   OK    press  pause in game, select in menus; tap to resume when paused;
+//   UP    press  flap (title/settings: move up)
+//   DOWN  press  lower the volume, wrapping from mute to high
+//                (title/settings: move down; game over: back to title)
+//   OK    press  pause in game, select in menus, change a setting's value;
+//                tap to resume when paused;
 //         hold   quit to title while paused, skip the tutorial
 #include "bsp_audio.h"
 #include "bsp_battery.h"
@@ -33,6 +35,7 @@ static const char *TAG = "flappy";
 
 #define INPUT_QUEUE_DEPTH 16
 #define GAME_TIMER_MS     16
+#define STATS_PERIOD_MS   5000
 
 typedef struct {
     flappy_key_t key;
@@ -43,6 +46,8 @@ static flappy_model_t s_model;           // owned by the LVGL task after start-u
 static QueueHandle_t s_input_queue;
 static volatile bool s_input_ready;
 static int64_t s_last_us;
+static uint32_t s_stats_ms;
+static uint32_t s_max_frame_ms;
 
 // Waking from deep sleep by key reboots the chip while that key is still held:
 // drop key actions until it comes up (deadline is only a stuck-key safety net).
@@ -87,9 +92,19 @@ static void play_sounds(uint32_t ev) {
     else if (ev & FLAPPY_EV_PAUSE)         flappy_sound_play(FLAPPY_SFX_PAUSE);
     else if (ev & (FLAPPY_EV_SELECT | FLAPPY_EV_RESUME)) flappy_sound_play(FLAPPY_SFX_SELECT);
     else if (ev & FLAPPY_EV_TUTORIAL_STEP) flappy_sound_play(FLAPPY_SFX_STEP);
-    else if (ev & FLAPPY_EV_DIVE)          flappy_sound_play(FLAPPY_SFX_DIVE);
+    else if (ev & FLAPPY_EV_VOLUME)        flappy_sound_play(FLAPPY_SFX_VOLUME);
     else if (ev & FLAPPY_EV_FLAP)          flappy_sound_play(FLAPPY_SFX_FLAP);
     else if (ev & FLAPPY_EV_MENU_MOVE)     flappy_sound_play(FLAPPY_SFX_MENU);
+}
+
+static void note_stats(uint32_t elapsed) {
+    if (elapsed > s_max_frame_ms) s_max_frame_ms = elapsed;
+    s_stats_ms += elapsed;
+    if (s_stats_ms < STATS_PERIOD_MS) return;
+    s_stats_ms = 0;
+    lv_mem_monitor_t mem;
+    lv_mem_monitor(&mem);
+    flappy_stats_note((uint32_t)mem.max_used, (uint32_t)mem.total_size, s_max_frame_ms);
 }
 
 static void game_tick(lv_timer_t *t) {
@@ -102,11 +117,24 @@ static void game_tick(lv_timer_t *t) {
     const int64_t now = esp_timer_get_time();
     uint32_t elapsed = (uint32_t)((now - s_last_us) / 1000);
     s_last_us += (int64_t)elapsed * 1000;   // keep the sub-millisecond remainder
+    note_stats(elapsed);
     flappy_advance(&s_model, elapsed);
 
     const uint32_t ev = flappy_take_events(&s_model);
+    if (ev & FLAPPY_EV_VOLUME) {
+        // Before play_sounds so the preview is heard at the new level.
+        flappy_sound_set_volume(flappy_volume_percent(s_model.volume));
+        flappy_store_save_setting(FLAPPY_SET_VOLUME, (uint8_t)s_model.volume);
+    }
+    if (ev & FLAPPY_EV_SETTING) {
+        const flappy_setting_t row = s_model.settings_sel;
+        const uint8_t value = row == FLAPPY_SET_FLAP ? (uint8_t)s_model.flap
+                            : row == FLAPPY_SET_DIFFICULTY ? (uint8_t)s_model.difficulty
+                            : (uint8_t)s_model.theme;
+        flappy_store_save_setting(row, value);
+    }
     play_sounds(ev);
-    if (ev & FLAPPY_EV_NEW_BEST) flappy_store_save_best(s_model.best);
+    if (ev & FLAPPY_EV_NEW_BEST) flappy_store_save_best(s_model.difficulty, s_model.best);
     if (ev & FLAPPY_EV_TUTORIAL_DONE) flappy_store_save_tutorial_done();
 
     flappy_ui_sync(&s_model, ev, elapsed);
@@ -130,12 +158,14 @@ void app_main(void) {
         return;
     }
 
-    uint16_t best = 0;
+    flappy_saved_t saved;
     bool tutorial_done = false;
-    if (flappy_store_load(&best, &tutorial_done) != ESP_OK) {
-        ESP_LOGW(TAG, "storage unavailable; best score will not persist");
+    if (flappy_store_load(&saved, &tutorial_done) != ESP_OK) {
+        ESP_LOGW(TAG, "storage unavailable; best scores and settings will not persist");
     }
-    flappy_init(&s_model, best, tutorial_done, esp_random());
+    flappy_init(&s_model, 0, tutorial_done, esp_random());
+    flappy_restore(&s_model, &saved);
+    flappy_sound_set_volume(flappy_volume_percent(s_model.volume));
 
     const bool audio_ok = bsp_audio_init() == ESP_OK;
     const bool battery_ok = bsp_battery_init() == ESP_OK;
@@ -175,6 +205,5 @@ void app_main(void) {
                                 bsp_button_read_mv() >= BSP_BTN_MV_RELEASED_MIN);
     }
     s_input_ready = true;
-    ESP_LOGI(TAG, "ready: audio=%d battery=%d best=%u tutorial_done=%d",
-             audio_ok, battery_ok, (unsigned)best, tutorial_done);
+    ESP_LOGI(TAG, "ready: audio=%d battery=%d tutorial_done=%d", audio_ok, battery_ok, tutorial_done);
 }

@@ -2,7 +2,7 @@
 //
 // Scene: flat sky with static clouds and hills, three recycled pipe pairs,
 // a scrolling ground strip, and an image-based bird rotated with its speed.
-// Overlays (title, tutorial card, ready, pause, game over) are created once
+// Overlays (title, settings, tutorial card, ready, pause, game over) are created once
 // and shown or hidden when the model state changes.
 #include "flappy_ui.h"
 
@@ -16,10 +16,6 @@
 // ---------------------------------------------------------------------------
 // Palette
 // ---------------------------------------------------------------------------
-#define C_SKY        0x86D3EE
-#define C_CLOUD      0xF4FBFF
-#define C_HILL_FAR   0xA7DE8C
-#define C_HILL_NEAR  0x86CC6E
 #define C_PIPE       0x5CBF4A
 #define C_PIPE_CAP   0x6ACD55
 #define C_PIPE_LIT   0x9BE37D
@@ -44,6 +40,22 @@
 #define STRIPE_PERIOD 24
 #define HIT_FLASH_MS 110
 
+// Scenery colours per theme. A zero orb colour hides the sun/moon.
+typedef struct {
+    uint32_t sky, cloud, hill_far, hill_near, orb;
+    bool stars;
+} theme_colors_t;
+
+static const theme_colors_t THEMES[FLAPPY_THEME_COUNT] = {
+    [FLAPPY_THEME_DAY]    = { 0x86D3EE, 0xF4FBFF, 0xA7DE8C, 0x86CC6E, 0, false },
+    [FLAPPY_THEME_SUNSET] = { 0xF7A072, 0xFFD9B8, 0xB5838D, 0x8E5572, 0xFFE08A, false },
+    [FLAPPY_THEME_NIGHT]  = { 0x14213D, 0x3A4A6B, 0x2A5A4A, 0x1F4638, 0xF2F4D8, true },
+};
+
+#define CLOUD_COUNT    9
+#define HILL_FAR_COUNT 2
+#define STAR_COUNT     7
+
 typedef struct {
     lv_obj_t *top_body, *top_cap, *bot_body, *bot_cap;
     int gap_y, gap_h;   // geometry currently applied (-1 = none)
@@ -57,9 +69,15 @@ static lv_image_dsc_t s_bird_dsc[FLAPPY_SPRITE_FRAMES];
 static lv_obj_t *s_scr;
 static lv_obj_t *s_bird;
 static pipe_view_t s_pipes[FLAPPY_PIPE_COUNT];
+static lv_obj_t *s_clouds[CLOUD_COUNT];
+static lv_obj_t *s_hills_far[HILL_FAR_COUNT];
+static lv_obj_t *s_hill_near;
+static lv_obj_t *s_orb;
+static lv_obj_t *s_stars[STAR_COUNT];
 static lv_obj_t *s_ground_scroller;
 static lv_obj_t *s_score, *s_score_shadow;
 static lv_obj_t *s_batt;
+static lv_obj_t *s_vol;
 static lv_obj_t *s_footer;
 static lv_obj_t *s_flash;
 
@@ -67,6 +85,11 @@ static lv_obj_t *s_title_layer;
 static lv_obj_t *s_menu_btn[FLAPPY_MENU_COUNT];
 static lv_obj_t *s_menu_lbl[FLAPPY_MENU_COUNT];
 static lv_obj_t *s_title_best;
+
+static lv_obj_t *s_settings_layer;
+static lv_obj_t *s_set_row[FLAPPY_SET_COUNT];
+static lv_obj_t *s_set_name[FLAPPY_SET_COUNT];
+static lv_obj_t *s_set_value[FLAPPY_SET_COUNT];
 
 static lv_obj_t *s_tut_card, *s_tut_step, *s_tut_title, *s_tut_body, *s_tut_key;
 static lv_obj_t *s_tut_key_lbl;
@@ -79,6 +102,8 @@ static int s_frame = -1;
 static int s_angle = 0x7fffffff;
 static int s_score_val = -1;
 static int s_battery = -2;
+static int s_volume = -1;
+static int s_theme = -1;
 static uint32_t s_flash_ms;
 static uint16_t s_last_attempts;
 static bool s_tut_flying;
@@ -200,19 +225,27 @@ static lv_obj_t *pipe_part(lv_obj_t *parent, int w, uint32_t color) {
 }
 
 static void build_scenery(void) {
+    static const int16_t stars[STAR_COUNT][2] = {
+        { 30, 30 }, { 110, 20 }, { 150, 46 }, { 215, 40 }, { 20, 110 }, { 130, 120 }, { 88, 150 },
+    };
+    for (int i = 0; i < STAR_COUNT; i++) {
+        s_stars[i] = box(s_scr, stars[i][0], stars[i][1], 3, 3, C_WHITE);
+    }
+    s_orb = blob(s_scr, 206, 150, 14, C_WHITE);
+
     // Clouds: clusters of overlapping circles.
-    static const int16_t clouds[][3] = {
+    static const int16_t clouds[CLOUD_COUNT][3] = {
         { 40, 70, 14 }, { 58, 64, 18 }, { 76, 72, 12 },
         { 168, 116, 12 }, { 184, 108, 16 }, { 200, 116, 11 },
         { 110, 188, 10 }, { 124, 182, 13 }, { 138, 190, 9 },
     };
-    for (size_t i = 0; i < sizeof(clouds) / sizeof(clouds[0]); i++) {
-        blob(s_scr, clouds[i][0], clouds[i][1], clouds[i][2], C_CLOUD);
+    for (int i = 0; i < CLOUD_COUNT; i++) {
+        s_clouds[i] = blob(s_scr, clouds[i][0], clouds[i][1], clouds[i][2], C_WHITE);
     }
     // Rolling hills peeking above the ground line.
-    blob(s_scr, 30, FLAPPY_GROUND_Y + 30, 62, C_HILL_FAR);
-    blob(s_scr, 200, FLAPPY_GROUND_Y + 40, 70, C_HILL_FAR);
-    blob(s_scr, 120, FLAPPY_GROUND_Y + 34, 44, C_HILL_NEAR);
+    s_hills_far[0] = blob(s_scr, 30, FLAPPY_GROUND_Y + 30, 62, C_WHITE);
+    s_hills_far[1] = blob(s_scr, 200, FLAPPY_GROUND_Y + 40, 70, C_WHITE);
+    s_hill_near = blob(s_scr, 120, FLAPPY_GROUND_Y + 34, 44, C_WHITE);
 }
 
 static void build_ground(void) {
@@ -244,6 +277,14 @@ static void build_hud(void) {
     lv_obj_set_style_pad_ver(s_batt, 1, 0);
     lv_obj_align(s_batt, LV_ALIGN_TOP_RIGHT, -24, 10);
 
+    s_vol = label(s_scr, &lv_font_montserrat_14, C_INK, "");
+    lv_obj_set_style_bg_color(s_vol, lv_color_hex(C_WHITE), 0);
+    lv_obj_set_style_bg_opa(s_vol, LV_OPA_60, 0);
+    lv_obj_set_style_radius(s_vol, 8, 0);
+    lv_obj_set_style_pad_hor(s_vol, 6, 0);
+    lv_obj_set_style_pad_ver(s_vol, 1, 0);
+    lv_obj_align(s_vol, LV_ALIGN_TOP_LEFT, 24, 10);
+
     s_footer = label(s_scr, &lv_font_montserrat_14, 0x6B4E1E, "");
     lv_obj_set_width(s_footer, 210);
     lv_obj_align(s_footer, LV_ALIGN_TOP_MID, 0, FLAPPY_GROUND_Y + 14);
@@ -259,22 +300,46 @@ static void build_title(void) {
     lv_obj_t *sub = label(ribbon, &lv_font_montserrat_14, C_INK, FLAPPY_TXT_SUBTITLE);
     lv_obj_center(sub);
 
-    static const char *names[FLAPPY_MENU_COUNT] = { FLAPPY_TXT_PLAY, FLAPPY_TXT_TUTORIAL };
+    static const char *names[FLAPPY_MENU_COUNT] = {
+        FLAPPY_TXT_PLAY, FLAPPY_TXT_TUTORIAL, FLAPPY_TXT_SETTINGS,
+    };
     for (int i = 0; i < FLAPPY_MENU_COUNT; i++) {
-        lv_obj_t *b = box(s_title_layer, 45, 180 + i * 42, 150, 34, C_PAPER);
-        lv_obj_set_style_radius(b, 17, 0);
+        lv_obj_t *b = box(s_title_layer, 45, 172 + i * 36, 150, 32, C_PAPER);
+        lv_obj_set_style_radius(b, 16, 0);
         lv_obj_set_style_border_color(b, lv_color_hex(C_INK), 0);
         lv_obj_set_style_border_width(b, 3, 0);
         s_menu_btn[i] = b;
         s_menu_lbl[i] = label(b, &lv_font_montserrat_20, C_INK, names[i]);
         lv_obj_center(s_menu_lbl[i]);
     }
-    lv_obj_t *pill = box(s_title_layer, 80, 258, 80, 20, C_PAPER);
+    lv_obj_t *pill = box(s_title_layer, 104, 140, 80, 20, C_PAPER);
     lv_obj_set_style_radius(pill, 10, 0);
     lv_obj_set_style_border_color(pill, lv_color_hex(C_INK), 0);
     lv_obj_set_style_border_width(pill, 2, 0);
     s_title_best = label(pill, &lv_font_montserrat_14, C_INK, "");
     lv_obj_center(s_title_best);
+}
+
+static void build_settings(void) {
+    s_settings_layer = layer(s_scr);
+    lv_obj_t *c = card_body(card(s_settings_layer, 16, 36, 208, 236));
+    lv_obj_t *t = label(c, &lv_font_montserrat_20, C_ACCENT_DK, FLAPPY_TXT_SETTINGS);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+    for (int i = 0; i < FLAPPY_SET_COUNT; i++) {
+        lv_obj_t *r = box(c, 8, 36 + i * 38, 186, 32, C_PAPER);
+        lv_obj_set_style_radius(r, 10, 0);
+        lv_obj_set_style_border_color(r, lv_color_hex(C_INK), 0);
+        lv_obj_set_style_border_width(r, 2, 0);
+        s_set_row[i] = r;
+        s_set_name[i] = label(r, &lv_font_montserrat_14, C_INK, FLAPPY_SETTING_NAMES[i]);
+        if (i == FLAPPY_SET_BACK) {
+            lv_obj_center(s_set_name[i]);
+            continue;
+        }
+        lv_obj_align(s_set_name[i], LV_ALIGN_LEFT_MID, 8, 0);
+        s_set_value[i] = label(r, &lv_font_montserrat_14, C_INK, "");
+        lv_obj_align(s_set_value[i], LV_ALIGN_RIGHT_MID, -8, 0);
+    }
 }
 
 static void build_tutorial(void) {
@@ -356,7 +421,7 @@ void flappy_ui_create(const flappy_model_t *m) {
 
     s_scr = lv_obj_create(NULL);
     lv_obj_remove_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(s_scr, lv_color_hex(C_SKY), 0);
+    lv_obj_set_style_bg_color(s_scr, lv_color_hex(THEMES[m->theme].sky), 0);
     lv_obj_set_style_bg_opa(s_scr, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(s_scr, 0, 0);
     lv_obj_set_style_border_width(s_scr, 0, 0);
@@ -381,6 +446,7 @@ void flappy_ui_create(const flappy_model_t *m) {
 
     build_hud();
     build_title();
+    build_settings();
     build_tutorial();
     build_ready();
     build_pause();
@@ -449,11 +515,36 @@ static void sync_score(const flappy_model_t *m) {
     lv_label_set_text_fmt(s_score_shadow, "%u", (unsigned)m->score);
 }
 
+static void sync_volume(const flappy_model_t *m) {
+    if ((int)m->volume == s_volume) return;
+    s_volume = m->volume;
+    const char *sym = m->volume == FLAPPY_VOL_MUTE ? LV_SYMBOL_MUTE
+                    : m->volume == FLAPPY_VOL_HIGH ? LV_SYMBOL_VOLUME_MAX
+                    : LV_SYMBOL_VOLUME_MID;
+    lv_label_set_text_fmt(s_vol, "%s %s", sym, FLAPPY_VOLUME_NAMES[m->volume]);
+}
+
+static void sync_theme(const flappy_model_t *m) {
+    if ((int)m->theme == s_theme) return;
+    s_theme = m->theme;
+    const theme_colors_t *t = &THEMES[m->theme];
+    lv_obj_set_style_bg_color(s_scr, lv_color_hex(t->sky), 0);
+    for (int i = 0; i < CLOUD_COUNT; i++) {
+        lv_obj_set_style_bg_color(s_clouds[i], lv_color_hex(t->cloud), 0);
+    }
+    for (int i = 0; i < HILL_FAR_COUNT; i++) {
+        lv_obj_set_style_bg_color(s_hills_far[i], lv_color_hex(t->hill_far), 0);
+    }
+    lv_obj_set_style_bg_color(s_hill_near, lv_color_hex(t->hill_near), 0);
+    show(s_orb, t->orb != 0);
+    if (t->orb) lv_obj_set_style_bg_color(s_orb, lv_color_hex(t->orb), 0);
+    for (int i = 0; i < STAR_COUNT; i++) show(s_stars[i], t->stars);
+}
+
 static const char *tutorial_key_name(flappy_tutorial_step_t step) {
     switch (step) {
     case FLAPPY_TUT_FLAP:
     case FLAPPY_TUT_GATE: return "UP";
-    case FLAPPY_TUT_DIVE: return "DOWN";
     case FLAPPY_TUT_DONE: return NULL;
     default:              return "OK";
     }
@@ -461,7 +552,7 @@ static const char *tutorial_key_name(flappy_tutorial_step_t step) {
 
 static void sync_tutorial(const flappy_model_t *m) {
     const flappy_tutorial_text_t *t = &FLAPPY_TUTORIAL_TEXT[m->tut_step];
-    const int n = (int)m->tut_step;   // FLAP..GATE are steps 1..5
+    const int n = (int)m->tut_step;   // FLAP..SETTINGS are steps 1..5
     if (n >= 1 && n <= FLAPPY_TUTORIAL_NUMBERED_STEPS) {
         lv_label_set_text_fmt(s_tut_step, FLAPPY_TXT_STEP_FMT, n, FLAPPY_TUTORIAL_NUMBERED_STEPS);
     } else {
@@ -486,9 +577,24 @@ static void sync_title(const flappy_model_t *m) {
     lv_label_set_text_fmt(s_title_best, FLAPPY_TXT_BEST_FMT, (unsigned)m->best);
 }
 
+static void sync_settings(const flappy_model_t *m) {
+    lv_label_set_text(s_set_value[FLAPPY_SET_VOLUME], FLAPPY_VOLUME_NAMES[m->volume]);
+    lv_label_set_text(s_set_value[FLAPPY_SET_FLAP], FLAPPY_FLAP_NAMES[m->flap]);
+    lv_label_set_text(s_set_value[FLAPPY_SET_DIFFICULTY], FLAPPY_DIFFICULTY_NAMES[m->difficulty]);
+    lv_label_set_text(s_set_value[FLAPPY_SET_THEME], FLAPPY_THEME_NAMES[m->theme]);
+    for (int i = 0; i < FLAPPY_SET_COUNT; i++) {
+        const bool sel = (int)m->settings_sel == i;
+        const lv_color_t text = lv_color_hex(sel ? C_WHITE : C_INK);
+        lv_obj_set_style_bg_color(s_set_row[i], lv_color_hex(sel ? C_ACCENT : C_PAPER), 0);
+        lv_obj_set_style_text_color(s_set_name[i], text, 0);
+        if (s_set_value[i]) lv_obj_set_style_text_color(s_set_value[i], text, 0);
+    }
+}
+
 static void sync_overlays(const flappy_model_t *m) {
     const flappy_state_t s = m->state;
     show(s_title_layer, s == FLAPPY_TITLE);
+    show(s_settings_layer, s == FLAPPY_SETTINGS);
     show(s_tut_card, s == FLAPPY_TUTORIAL);
     show(s_ready_card, s == FLAPPY_READY);
     show(s_pause_layer, s == FLAPPY_PAUSED);
@@ -501,6 +607,10 @@ static void sync_overlays(const flappy_model_t *m) {
     case FLAPPY_TITLE:
         sync_title(m);
         lv_label_set_text(s_footer, FLAPPY_TXT_TITLE_HINT);
+        break;
+    case FLAPPY_SETTINGS:
+        sync_settings(m);
+        lv_label_set_text(s_footer, FLAPPY_TXT_SETTINGS_HINT);
         break;
     case FLAPPY_TUTORIAL:
         sync_tutorial(m);
@@ -544,6 +654,8 @@ void flappy_ui_sync(const flappy_model_t *m, uint32_t events, uint32_t elapsed_m
     sync_pipes(m);
     sync_bird(m);
     sync_score(m);
+    sync_volume(m);
+    sync_theme(m);
     lv_obj_set_x(s_ground_scroller, -flappy_ground_offset(m, STRIPE_PERIOD));
 
     if (events & FLAPPY_EV_HIT) {
